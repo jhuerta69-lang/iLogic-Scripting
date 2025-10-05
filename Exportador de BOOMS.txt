@@ -1,0 +1,225 @@
+' Exportar todas las Parts Lists (BOM) y nombrar archivos con el TÍTULO del Parts List.
+
+Sub Main()
+
+    Dim app As Inventor.Application = ThisApplication
+    If app.ActiveDocumentType <> Inventor.DocumentTypeEnum.kDrawingDocumentObject Then
+        System.Windows.Forms.MessageBox.Show("Abre un Drawing (.idw/.dwg).", "Exportar BOMs", _
+            System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Exclamation)
+        Exit Sub
+    End If
+
+    Dim oDraw As Inventor.DrawingDocument = TryCast(app.ActiveDocument, Inventor.DrawingDocument)
+    If oDraw Is Nothing Then
+        System.Windows.Forms.MessageBox.Show("No se pudo acceder al Drawing activo.", "Exportar BOMs", _
+            System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error)
+        Exit Sub
+    End If
+
+    ' Carpeta por defecto
+    Dim defaultDir As String = ""
+    Try
+        defaultDir = System.IO.Path.GetDirectoryName(oDraw.FullFileName)
+        If String.IsNullOrEmpty(defaultDir) Then
+            defaultDir = System.Environment.GetFolderPath(System.Environment.SpecialFolder.DesktopDirectory)
+        End If
+    Catch
+        defaultDir = System.Environment.GetFolderPath(System.Environment.SpecialFolder.DesktopDirectory)
+    End Try
+
+    Dim dlg As New System.Windows.Forms.FolderBrowserDialog()
+    dlg.Description = "Elige la carpeta destino para exportar todas las Parts Lists:"
+    dlg.SelectedPath = defaultDir
+    If dlg.ShowDialog() <> System.Windows.Forms.DialogResult.OK Then Exit Sub
+
+    Dim outDir As String = dlg.SelectedPath
+    If String.IsNullOrWhiteSpace(outDir) OrElse Not System.IO.Directory.Exists(outDir) Then
+        System.Windows.Forms.MessageBox.Show("Carpeta no válida.", "Exportar BOMs", _
+            System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error)
+        Exit Sub
+    End If
+
+    Dim totalPL As Integer = 0
+    Dim okCnt As Integer = 0
+    Dim log As New System.Text.StringBuilder()
+
+    ' Descubrir nombres de formato disponibles
+    Dim enumType As System.Type = GetType(Inventor.PartsListFileFormatEnum)
+    Dim allNames() As String = System.[Enum].GetNames(enumType)
+
+    Dim excelLike As New System.Collections.ArrayList()
+    Dim textLike As New System.Collections.ArrayList()
+    Dim i As Integer
+    For i = 0 To allNames.Length - 1
+        Dim nm As String = allNames(i)
+        Dim nmL As String = nm.ToLowerInvariant()
+        If (InStr(nmL, "excel") > 0) Or (InStr(nmL, "xls") > 0) Then
+            excelLike.Add(nm)
+        ElseIf (InStr(nmL, "csv") > 0) Or (InStr(nmL, "text") > 0) Or (InStr(nmL, "tab") > 0) Then
+            textLike.Add(nm)
+        Else
+            textLike.Add(nm)
+        End If
+    Next
+
+    If oDraw.Sheets.Count = 0 Then
+        System.Windows.Forms.MessageBox.Show("El drawing no tiene hojas.", "Exportar BOMs", _
+            System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Information)
+        Exit Sub
+    End If
+
+    Dim s As Integer
+    For s = 1 To oDraw.Sheets.Count
+        Dim sh As Inventor.Sheet = oDraw.Sheets.Item(s)
+        If (sh.PartsLists Is Nothing) Or (sh.PartsLists.Count = 0) Then Continue For
+
+        Dim plIdx As Integer = 0
+        Dim pl As Inventor.PartsList
+        For Each pl In sh.PartsLists
+            plIdx = plIdx + 1
+            totalPL = totalPL + 1
+
+            ' Obtener título del Parts List
+            Dim titleRaw As String = ""
+            Try
+                ' Propiedad estándar del objeto PartsList
+                titleRaw = pl.Title
+            Catch
+                titleRaw = ""
+            End Try
+
+            Dim safeTitle As String = SafeFileName(titleRaw)
+            If String.IsNullOrWhiteSpace(safeTitle) Then
+                safeTitle = "Sheet" & s & "_PL" & plIdx
+            End If
+
+            ' Omitir PL vacías si es posible detectarlo
+            Dim isEmpty As Boolean = False
+            Try
+                If (pl.Rows Is Nothing) Or (pl.Rows.Count = 0) Then isEmpty = True
+            Catch
+            End Try
+            If isEmpty Then
+                log.AppendLine("Hoja " & s & ", PL " & plIdx & " (" & safeTitle & "): sin filas, omitida.")
+                Continue For
+            End If
+
+            Dim exported As Boolean = False
+            Dim usedName As String = ""
+            Dim usedFormat As String = ""
+
+            ' 1) Intentar Excel-like primero
+            Dim idx As Integer
+            For idx = 0 To excelLike.Count - 1
+                Dim nm As String = CStr(excelLike(idx))
+                Dim ext As String = ".xls"
+                If LCase(nm).Contains("xlsx") Then ext = ".xlsx"
+                Dim target As String = MakeUniqueFile(System.IO.Path.Combine(outDir, safeTitle & ext))
+                If TryExportWith(pl, target, nm) Then
+                    exported = True : usedName = System.IO.Path.GetFileName(target) : usedFormat = nm
+                    Exit For
+                End If
+            Next
+
+            ' 2) Si no, CSV/TXT/TAB/otros
+            If Not exported Then
+                For idx = 0 To textLike.Count - 1
+                    Dim nm As String = CStr(textLike(idx))
+                    Dim nmL As String = LCase(nm)
+                    Dim ext As String
+                    If InStr(nmL, "csv") > 0 Then
+                        ext = ".csv"
+                    ElseIf InStr(nmL, "tab") > 0 Then
+                        ext = ".txt"
+                    Else
+                        ext = ".txt"
+                    End If
+                    Dim target As String = MakeUniqueFile(System.IO.Path.Combine(outDir, safeTitle & ext))
+                    If TryExportWith(pl, target, nm) Then
+                        exported = True : usedName = System.IO.Path.GetFileName(target) : usedFormat = nm
+                        Exit For
+                    End If
+                Next
+            End If
+
+            If exported Then
+                okCnt = okCnt + 1
+                log.AppendLine("Hoja " & s & ", PL " & plIdx & " (" & safeTitle & "): OK → " & usedName & " (" & usedFormat & ").")
+            Else
+                log.AppendLine("Hoja " & s & ", PL " & plIdx & " (" & safeTitle & "): FALLÓ (sin formato válido o error al escribir).")
+            End If
+
+        Next
+    Next
+
+    Dim msg As String = _
+        "Part Lists detectadas: " & totalPL & vbCrLf & _
+        "Exportadas correctamente: " & okCnt & vbCrLf & _
+        "Carpeta: " & outDir & vbCrLf & vbCrLf & _
+        "Detalle:" & vbCrLf & log.ToString()
+
+    System.Windows.Forms.MessageBox.Show(msg, "Exportar BOMs", _
+        System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Information)
+
+    ' Abrir carpeta
+    Try
+        System.Diagnostics.Process.Start("explorer.exe", outDir)
+    Catch
+    End Try
+
+End Sub
+
+' ===== Helpers =====
+
+Private Function TryExportWith(pl As Inventor.PartsList, filePath As String, enumName As String) As Boolean
+    Try
+        Dim enumType As System.Type = GetType(Inventor.PartsListFileFormatEnum)
+        Dim val As Object = System.[Enum].Parse(enumType, enumName, True)
+        pl.Export(filePath, CType(val, Inventor.PartsListFileFormatEnum))
+        Return True
+    Catch
+        Return False
+    End Try
+End Function
+
+Private Function MakeUniqueFile(basePath As String) As String
+    Dim dir As String = System.IO.Path.GetDirectoryName(basePath)
+    Dim nameOnly As String = System.IO.Path.GetFileNameWithoutExtension(basePath)
+    Dim ext As String = System.IO.Path.GetExtension(basePath)
+    Dim candidate As String = basePath
+    Dim k As Integer = 1
+    While System.IO.File.Exists(candidate)
+        candidate = System.IO.Path.Combine(dir, nameOnly & "(" & k & ")" & ext)
+        k = k + 1
+    End While
+    Return candidate
+End Function
+
+Private Function SafeFileName(rawName As String) As String
+    If rawName Is Nothing Then rawName = ""
+    Dim s As String = rawName.Trim()
+    If s = "" Then Return ""
+    ' Reemplazar caracteres inválidos por guion bajo
+    Dim invalid() As Char = System.IO.Path.GetInvalidFileNameChars()
+    Dim c As Char
+    Dim sb As New System.Text.StringBuilder()
+    For Each c In s
+        Dim bad As Boolean = False
+        Dim j As Integer
+        For j = 0 To invalid.Length - 1
+            If c = invalid(j) Then bad = True : Exit For
+        Next
+        If bad Then
+            sb.Append("_")
+        Else
+            sb.Append(c)
+        End If
+    Next
+    ' Evitar nombres reservados o terminados en punto/espacio
+    s = sb.ToString().Trim()
+    While s.EndsWith(".") Or s.EndsWith(" ")
+        s = Left(s, Len(s) - 1)
+    End While
+    If s = "" Then s = "PartsList"
+    Return s
+End Function
